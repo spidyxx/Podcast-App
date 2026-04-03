@@ -1,8 +1,8 @@
 # Podcast Feed Manager
 
-A Windows desktop app for managing and downloading podcast/video RSS feeds. Built with Python and customtkinter.
+A desktop app for managing and downloading podcast/video RSS feeds. Built with Python and customtkinter.
 
-![Python](https://img.shields.io/badge/python-3.9%2B-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## Features
 
@@ -19,9 +19,33 @@ A Windows desktop app for managing and downloading podcast/video RSS feeds. Buil
 ## Requirements
 
 - Python 3.9 or later
-- Windows 10 or later
+- Windows 10 or later, or a modern Linux desktop (Ubuntu, Fedora, etc.)
 
 ## Installation
+
+### Windows
+
+```bash
+git clone https://github.com/spidyxx/Podcast-App.git
+cd Podcast-App
+pip install -r requirements.txt
+python app.py
+```
+
+### Linux
+
+Install the tkinter system package first, then proceed as normal:
+
+```bash
+# Debian / Ubuntu
+sudo apt install python3-tk
+
+# Fedora
+sudo dnf install python3-tkinter
+
+# Arch
+sudo pacman -S tk
+```
 
 ```bash
 git clone https://github.com/spidyxx/Podcast-App.git
@@ -75,7 +99,7 @@ Downloaded files are saved to `~/Downloads/Podcasts/` by default. You can change
 
 Click **Play** in the detail panel. If the episode has been downloaded the local file is opened; otherwise the stream URL is opened directly.
 
-Player priority: VLC → MPC-HC → Windows default.
+Player priority: VLC → MPC-HC → system default (`xdg-open` on Linux).
 
 ### Settings
 

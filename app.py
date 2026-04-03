@@ -49,10 +49,16 @@ AVATAR_SIZE   = (52, 52)    # host avatar in detail panel
 PODCAST_NS    = "https://podcastindex.org/namespace/1.0"
 
 VLC_PATHS = [
+    # Windows
     r"C:\Program Files\VideoLAN\VLC\vlc.exe",
     r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+    # Linux
+    "/usr/bin/vlc",
+    "/usr/local/bin/vlc",
+    "/snap/bin/vlc",
 ]
 MPC_PATHS = [
+    # Windows only
     r"C:\Program Files\MPC-HC\mpc-hc64.exe",
     r"C:\Program Files\MPC-HC\mpc-hc.exe",
     r"C:\Program Files (x86)\MPC-HC\mpc-hc.exe",
@@ -340,6 +346,19 @@ def load_feed_cache(url: str) -> list:
         return []
 
 
+def _open_with_system_default(path: str):
+    """Open a file or URL with the system default handler, cross-platform."""
+    if sys.platform == "win32":
+        try:
+            os.startfile(path)
+        except Exception:
+            subprocess.Popen(["cmd", "/c", "start", "", path], shell=False)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
 def open_video(filepath: str, player_path: str = ""):
     """Open a file/URL in the best available player."""
     filepath = str(filepath)
@@ -351,11 +370,8 @@ def open_video(filepath: str, player_path: str = ""):
         if os.path.exists(p):
             subprocess.Popen([p, filepath])
             return
-    # Windows default
-    try:
-        os.startfile(filepath)
-    except Exception:
-        subprocess.Popen(["cmd", "/c", "start", "", filepath], shell=False)
+    # System default
+    _open_with_system_default(filepath)
 
 
 # ─── Feed Parser ──────────────────────────────────────────────────────────────
@@ -1249,11 +1265,15 @@ class DetailPanel(ctk.CTkFrame):
             return
         fp = self._state.get_filepath(self._episode["guid"])
         if fp:
-            subprocess.Popen(["explorer", "/select,", str(fp)])
+            if sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", str(fp)])
+            else:
+                # Open the containing folder; file selection not supported cross-platform
+                _open_with_system_default(str(fp.parent))
         else:
             folder = self._state.download_folder
             os.makedirs(folder, exist_ok=True)
-            os.startfile(folder)
+            _open_with_system_default(folder)
 
 
 # ─── Add Feed Dialog ──────────────────────────────────────────────────────────
