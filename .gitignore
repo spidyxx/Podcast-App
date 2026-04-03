@@ -12,6 +12,11 @@ __pycache__/
 *.pyo
 *.pyd
 
+# PyInstaller
+dist/
+build/
+*.spec
+
 # Virtual environments
 venv/
 .venv/
