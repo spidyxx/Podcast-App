@@ -44,7 +44,7 @@ APP_TITLE = "Podcast Feed Manager"
 DEFAULT_DOWNLOAD_FOLDER = str(Path.home() / "Downloads" / "Podcasts")
 
 THUMBNAIL_SM  = (128, 72)   # 16:9 thumbnail in episode list
-THUMBNAIL_LG  = (400, 225)  # 16:9 thumbnail in detail panel
+THUMBNAIL_MD  = (284, 160)  # 16:9 thumbnail in detail panel (beside metadata)
 AVATAR_SIZE   = (52, 52)    # host avatar in detail panel
 PODCAST_NS    = "https://podcastindex.org/namespace/1.0"
 
@@ -76,6 +76,7 @@ class StateManager:
             "downloaded": {},  # guid → {"filename": str, "downloaded_at": str}
             "feeds": [],       # list of {"name": str, "url": str}
             "active_feed_idx": 0,
+            "auto_keep": 0,    # 0 = disabled; N = keep only N most recent episodes
         }
         self._load()
 
@@ -159,6 +160,34 @@ class StateManager:
 
     def is_watched(self, guid: str) -> bool:
         return guid in self._data.get("watched", [])
+
+    # ── Deletion ──────────────────────────────────────────────────────────────
+
+    def delete_episode(self, guid: str) -> bool:
+        """Delete the downloaded file and remove the record. Returns True on success."""
+        if guid not in self._data["downloaded"]:
+            return False
+        fp = self._get_path(guid)
+        try:
+            if fp.exists():
+                fp.unlink()
+        except Exception as e:
+            print(f"[delete] failed to remove file: {e}")
+            return False
+        del self._data["downloaded"][guid]
+        self.save()
+        return True
+
+    # ── Auto-keep ─────────────────────────────────────────────────────────────
+
+    @property
+    def auto_keep(self) -> int:
+        return self._data.get("auto_keep", 0)
+
+    @auto_keep.setter
+    def auto_keep(self, value: int):
+        self._data["auto_keep"] = max(0, value)
+        self.save()
 
     # ── Feeds ─────────────────────────────────────────────────────────────────
 
@@ -357,6 +386,56 @@ def _open_with_system_default(path: str):
         subprocess.Popen(["open", path])
     else:
         subprocess.Popen(["xdg-open", path])
+
+
+def download_file(url: str, filepath: Path, progress_cb=None,
+                  retries: int = 3, retry_delay: float = 5.0):
+    """
+    Stream-download url to filepath, calling progress_cb(received, total) per chunk.
+    Retries up to `retries` times on connection errors with `retry_delay` seconds between attempts.
+    Raises on final failure.
+    """
+    import time
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        received = 0
+        total = 0
+        try:
+            resp = requests.get(
+                url, stream=True, timeout=30,
+                headers={"User-Agent": "TWiT-FeedManager/1.0"},
+            )
+            resp.raise_for_status()
+            total = int(resp.headers.get("content-length", 0))
+            with open(filepath, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=131072):
+                    if chunk:
+                        fh.write(chunk)
+                        received += len(chunk)
+                        if progress_cb:
+                            progress_cb(received, total)
+            return  # success
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as exc:
+            last_exc = exc
+            # Only delete if incomplete — a ConnectionError during close
+            # can fire after all bytes were written
+            if total == 0 or received < total:
+                try:
+                    if filepath.exists():
+                        filepath.unlink()
+                except Exception:
+                    pass
+            if attempt < retries:
+                time.sleep(retry_delay)
+        except Exception:
+            try:
+                if filepath.exists():
+                    filepath.unlink()
+            except Exception:
+                pass
+            raise
+    raise last_exc
 
 
 def open_video(filepath: str, player_path: str = ""):
@@ -773,11 +852,12 @@ class EpisodeListCanvas(ctk.CTkFrame):
 # ─── Settings Dialog ──────────────────────────────────────────────────────────
 
 class SettingsDialog(ctk.CTkToplevel):
-    def __init__(self, parent, state: StateManager):
+    def __init__(self, parent, state: StateManager, on_save=None):
         super().__init__(parent)
         self._state = state
+        self._on_save = on_save
         self.title("Settings")
-        self.geometry("520x240")
+        self.geometry("520x310")
         self.resizable(False, False)
         self.grab_set()
         self.grid_columnconfigure(1, weight=1)
@@ -800,15 +880,29 @@ class SettingsDialog(ctk.CTkToplevel):
 
         self._player_var = ctk.StringVar(value=state.player_path)
         ctk.CTkEntry(self, textvariable=self._player_var,
-                     placeholder_text="Auto-detect VLC → MPC-HC → Windows default").grid(
+                     placeholder_text="Auto-detect VLC → MPC-HC → system default").grid(
             row=3, column=0, columnspan=2, padx=16, pady=(0, 6), sticky="ew")
         ctk.CTkButton(self, text="Browse…", width=90,
                       command=self._browse_player).grid(
             row=3, column=2, padx=(4, 16), pady=(0, 6))
 
+        # Auto-keep row
+        ctk.CTkLabel(
+            self,
+            text="Auto-keep last N episodes (0 = disabled, older episodes are deleted automatically):",
+            anchor="w", wraplength=480, justify="left",
+        ).grid(row=4, column=0, columnspan=3, padx=16, pady=(12, 2), sticky="w")
+
+        keep_frame = ctk.CTkFrame(self, fg_color="transparent")
+        keep_frame.grid(row=5, column=0, columnspan=3, padx=16, pady=(0, 6), sticky="w")
+        self._keep_var = ctk.StringVar(value=str(state.auto_keep))
+        ctk.CTkEntry(keep_frame, textvariable=self._keep_var, width=60).pack(side="left")
+        ctk.CTkLabel(keep_frame, text="  episodes  (feed order: newest first)",
+                     text_color="gray55", font=ctk.CTkFont(size=12)).pack(side="left")
+
         # Buttons
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
-        btn_row.grid(row=4, column=0, columnspan=3, padx=16, pady=12, sticky="e")
+        btn_row.grid(row=6, column=0, columnspan=3, padx=16, pady=12, sticky="e")
         ctk.CTkButton(btn_row, text="Cancel", width=80,
                       fg_color="gray30", hover_color="gray40",
                       command=self.destroy).pack(side="right", padx=(6, 0))
@@ -834,18 +928,25 @@ class SettingsDialog(ctk.CTkToplevel):
     def _save(self):
         self._state.download_folder = self._folder_var.get()
         self._state.player_path = self._player_var.get()
+        try:
+            self._state.auto_keep = int(self._keep_var.get())
+        except ValueError:
+            pass
         self.destroy()
+        if self._on_save:
+            self._on_save()
 
 
 # ─── Detail Panel ─────────────────────────────────────────────────────────────
 
 class DetailPanel(ctk.CTkFrame):
     def __init__(self, parent, state: StateManager,
-                 on_downloaded=None, on_state_changed=None, **kw):
+                 on_downloaded=None, on_state_changed=None, auto_dl_jobs=None, **kw):
         super().__init__(parent, **kw)
         self._state = state
         self._on_downloaded    = on_downloaded     # callback() when a download finishes
         self._on_state_changed = on_state_changed  # callback() when fav/watched toggles
+        self._auto_dl_jobs     = auto_dl_jobs or {}
         self._episode = None
         self._thumb_img = None
 
@@ -854,9 +955,9 @@ class DetailPanel(ctk.CTkFrame):
         # tkinter still references it by name, causing TclError on the next
         # redraw. Keeping a stable CTkImage on the label at all times avoids
         # the issue; we overlay status text with compound="center".
-        _ph = Image.new("RGB", THUMBNAIL_LG, (20, 20, 20))
+        _ph = Image.new("RGB", THUMBNAIL_MD, (20, 20, 20))
         self._blank_thumb = ctk.CTkImage(
-            light_image=_ph, dark_image=_ph, size=THUMBNAIL_LG
+            light_image=_ph, dark_image=_ph, size=THUMBNAIL_MD
         )
 
         # Download tracking (written by bg thread, read by after() poll)
@@ -870,53 +971,62 @@ class DetailPanel(ctk.CTkFrame):
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build(self):
-        self.grid_rowconfigure(4, weight=1)   # description row
+        self.grid_rowconfigure(1, weight=1)   # description row expands
         self.grid_columnconfigure(0, weight=1)
 
-        # Large thumbnail — always holds a CTkImage (blank or real) so the
-        # underlying PhotoImage name is never stale when tkinter redraws.
+        # ── Top section: thumbnail (left) + metadata (right) ─────────────────
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="ew")
+        top.grid_columnconfigure(1, weight=1)
+
+        # Thumbnail — always holds a CTkImage so the underlying PhotoImage
+        # name is never stale when tkinter redraws.
         self._thumb = ctk.CTkLabel(
-            self, image=self._blank_thumb,
-            text="Select an episode to view details",
+            top, image=self._blank_thumb,
+            text="Select an episode\nto view details",
             compound="center",
-            height=THUMBNAIL_LG[1], fg_color="#141414", corner_radius=8,
-            font=ctk.CTkFont(size=14), text_color="gray40",
+            width=THUMBNAIL_MD[0], height=THUMBNAIL_MD[1],
+            fg_color="#141414", corner_radius=8,
+            font=ctk.CTkFont(size=12), text_color="gray40",
         )
-        self._thumb.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="ew")
+        self._thumb.grid(row=0, column=0, padx=(0, 14), sticky="nw")
 
-        # Title
+        # Right column: title, meta, hosts stacked vertically
+        right = ctk.CTkFrame(top, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+
         self._title = ctk.CTkLabel(
-            self, text="", anchor="w", justify="left",
-            font=ctk.CTkFont(size=17, weight="bold"),
-            wraplength=460,
+            right, text="", anchor="nw", justify="left",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            wraplength=300,
         )
-        self._title.grid(row=1, column=0, padx=16, pady=(4, 0), sticky="w")
+        self._title.grid(row=0, column=0, sticky="new", pady=(0, 6))
 
-        # Metadata (date · duration)
         self._meta = ctk.CTkLabel(
-            self, text="", anchor="w",
+            right, text="", anchor="w",
             font=ctk.CTkFont(size=12), text_color="gray55",
         )
-        self._meta.grid(row=2, column=0, padx=16, pady=(2, 8), sticky="w")
+        self._meta.grid(row=1, column=0, sticky="w", pady=(0, 10))
 
         # Hosts bar — hidden until an episode with hosts is loaded
-        self._hosts_frame = ctk.CTkFrame(self, fg_color="#1a1a1a", corner_radius=6)
-        self._hosts_frame.grid(row=3, column=0, padx=16, pady=(0, 6), sticky="ew")
+        self._hosts_frame = ctk.CTkFrame(right, fg_color="#1a1a1a", corner_radius=6)
+        self._hosts_frame.grid(row=2, column=0, sticky="ew")
         self._hosts_inner = ctk.CTkFrame(self._hosts_frame, fg_color="transparent")
         self._hosts_inner.pack(fill="x", padx=10, pady=6)
         self._hosts_frame.grid_remove()
         self._host_avatars = []   # keep CTkImage refs alive
 
-        # Description textbox
+        # ── Description (full width, expands to fill space) ──────────────────
         self._desc = ctk.CTkTextbox(
             self, wrap="word", state="disabled",
             font=ctk.CTkFont(size=12), fg_color="#1c1c1c",
         )
-        self._desc.grid(row=4, column=0, padx=16, pady=(0, 6), sticky="nsew")
+        self._desc.grid(row=1, column=0, padx=16, pady=(0, 6), sticky="nsew")
 
-        # Progress row (hidden until a download starts)
+        # ── Progress row (hidden until a download starts) ─────────────────────
         self._prog_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self._prog_frame.grid(row=5, column=0, padx=16, pady=(0, 2), sticky="ew")
+        self._prog_frame.grid(row=2, column=0, padx=16, pady=(0, 2), sticky="ew")
         self._prog_frame.grid_columnconfigure(0, weight=1)
         self._prog_bar = ctk.CTkProgressBar(self._prog_frame, height=12)
         self._prog_bar.set(0)
@@ -928,9 +1038,9 @@ class DetailPanel(ctk.CTkFrame):
         self._prog_label.grid(row=0, column=1)
         self._prog_frame.grid_remove()
 
-        # Action buttons
+        # ── Action buttons ────────────────────────────────────────────────────
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
-        btn_row.grid(row=6, column=0, padx=16, pady=(4, 4), sticky="w")
+        btn_row.grid(row=3, column=0, padx=16, pady=(4, 4), sticky="w")
 
         self._dl_btn = ctk.CTkButton(
             btn_row, text="Download", width=120,
@@ -951,11 +1061,18 @@ class DetailPanel(ctk.CTkFrame):
             command=self._open_folder,
             fg_color="#474747", hover_color="#363636",
         )
-        self._folder_btn.pack(side="left")
+        self._folder_btn.pack(side="left", padx=(0, 8))
 
-        # Second button row: favourite + watched
+        self._delete_btn = ctk.CTkButton(
+            btn_row, text="🗑  Delete", width=90,
+            command=self._delete,
+            fg_color="#6a2a2a", hover_color="#8a3a3a",
+        )
+        self._delete_btn.pack(side="left")
+
+        # ── Second button row: favourite + watched ────────────────────────────
         btn_row2 = ctk.CTkFrame(self, fg_color="transparent")
-        btn_row2.grid(row=7, column=0, padx=16, pady=(0, 14), sticky="w")
+        btn_row2.grid(row=4, column=0, padx=16, pady=(0, 14), sticky="w")
 
         self._fav_btn = ctk.CTkButton(
             btn_row2, text="☆  Favourite", width=130,
@@ -976,7 +1093,7 @@ class DetailPanel(ctk.CTkFrame):
     def _set_btns(self, enabled: bool):
         state = "normal" if enabled else "disabled"
         for b in (self._dl_btn, self._play_btn, self._folder_btn,
-                  self._fav_btn, self._watched_btn):
+                  self._delete_btn, self._fav_btn, self._watched_btn):
             b.configure(state=state)
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -986,10 +1103,26 @@ class DetailPanel(ctk.CTkFrame):
         self._episode = episode
         self._thumb_img = None
 
-        # Reset progress UI
-        self._prog_frame.grid_remove()
-        self._prog_bar.set(0)
-        self._prog_label.configure(text="0%")
+        # Check for an active auto-download BEFORE touching the progress bar,
+        # so we never hide it and have to race to show it again.
+        active_job = self._auto_dl_jobs.get(episode["guid"])
+        is_auto_downloading = active_job and active_job["status"] == "downloading"
+
+        if is_auto_downloading:
+            # Show / update bar immediately with current progress
+            self._prog_frame.grid(row=2, column=0, padx=16, pady=(0, 2), sticky="ew")
+            prog = active_job["progress"]
+            self._prog_bar.set(prog)
+            if prog > 0:
+                self._prog_label.configure(text=f"{int(prog * 100)}%")
+            else:
+                mb = active_job["bytes"] / 1_048_576
+                self._prog_label.configure(text=f"{mb:.1f} MB")
+            self._dl_btn.configure(state="disabled", text="Downloading…")
+        else:
+            self._prog_frame.grid_remove()
+            self._prog_bar.set(0)
+            self._prog_label.configure(text="0%")
 
         self._title.configure(text=episode["title"])
 
@@ -1013,7 +1146,7 @@ class DetailPanel(ctk.CTkFrame):
         if url:
             guid = episode["guid"]
             def _fetch():
-                img = fetch_image(url, THUMBNAIL_LG)
+                img = fetch_image(url, THUMBNAIL_MD)
                 if img and self._episode and self._episode["guid"] == guid:
                     self._thumb_img = img
                     try:
@@ -1033,6 +1166,9 @@ class DetailPanel(ctk.CTkFrame):
         self._refresh_fav_btn()
         self._refresh_watched_btn()
 
+        # Watch for an auto-download job for this episode (may not have started yet)
+        self._watch_auto_dl(episode["guid"])
+
     # ── Download button state ─────────────────────────────────────────────────
 
     def _refresh_dl_btn(self):
@@ -1044,11 +1180,13 @@ class DetailPanel(ctk.CTkFrame):
                 fg_color="#1e4a1e",
             )
             self._play_btn.configure(state="normal")
+            self._delete_btn.configure(state="normal")
         else:
             self._dl_btn.configure(
                 text="Download", state="normal",
                 fg_color="#1f6aa5",
             )
+            self._delete_btn.configure(state="disabled")
 
     # ── Download logic ────────────────────────────────────────────────────────
 
@@ -1076,37 +1214,78 @@ class DetailPanel(ctk.CTkFrame):
             filename = sanitize_filename(episode["title"]) + ext
             filepath = folder / filename
 
+            def _progress(received, total):
+                self._dl_bytes = received
+                self._dl_progress = received / total if total else 0.0
+
             try:
-                resp = requests.get(url, stream=True, timeout=30,
-                                    headers={"User-Agent": "TWiT-FeedManager/1.0"})
-                resp.raise_for_status()
-                total = int(resp.headers.get("content-length", 0))
-                received = 0
-
-                with open(filepath, "wb") as fh:
-                    for chunk in resp.iter_content(chunk_size=131072):
-                        if chunk:
-                            fh.write(chunk)
-                            received += len(chunk)
-                            self._dl_bytes = received
-                            if total:
-                                self._dl_progress = received / total
-
+                download_file(url, filepath, progress_cb=_progress)
                 self._state.mark_downloaded(episode["guid"], filename)
                 self._dl_progress = 1.0
                 self._dl_status = "done"
-
             except Exception as exc:
                 self._dl_status = f"error:{exc}"
-                # Remove partial file
-                try:
-                    if filepath.exists():
-                        filepath.unlink()
-                except Exception:
-                    pass
 
         threading.Thread(target=_worker, daemon=True).start()
         self._poll_progress()
+
+    def _delete(self):
+        if not self._episode:
+            return
+        guid = self._episode["guid"]
+        if not self._state.is_downloaded(guid):
+            return
+        from tkinter import messagebox
+        if not messagebox.askyesno(
+            "Delete Episode",
+            f"Delete the downloaded file for:\n\n{self._episode['title']}\n\nThis cannot be undone.",
+            parent=self,
+        ):
+            return
+        self._state.delete_episode(guid)
+        self._refresh_dl_btn()
+        if self._on_downloaded:
+            self._on_downloaded(guid)
+
+    def _watch_auto_dl(self, guid: str, _retries: int = 30):
+        """
+        Poll _auto_dl_jobs for this episode and update the progress bar.
+        Retries every 500 ms while the job hasn't appeared yet (up to _retries times),
+        then polls every 250 ms once the download is active.
+        Stops automatically when the episode changes or the download ends.
+        """
+        if not self._episode or self._episode["guid"] != guid:
+            return  # user switched away — stop
+        job = self._auto_dl_jobs.get(guid)
+        if job is None:
+            # Job not registered yet — retry shortly
+            if _retries > 0:
+                self._poll_id = self.after(150, lambda: self._watch_auto_dl(guid, _retries - 1))
+            return
+        status = job["status"]
+        if status == "done":
+            self._prog_bar.set(1.0)
+            self._prog_label.configure(text="100%")
+            self._prog_frame.grid_remove()
+            self._refresh_dl_btn()
+            return
+        if status.startswith("error:"):
+            self._prog_frame.grid_remove()
+            self._dl_btn.configure(
+                state="normal", text="Retry Download", fg_color="#7a1a1a",
+            )
+            return
+        # Actively downloading — show / update progress bar and disable button
+        self._prog_frame.grid(row=2, column=0, padx=16, pady=(0, 2), sticky="ew")
+        self._dl_btn.configure(state="disabled", text="Downloading…")
+        prog = job["progress"]
+        if prog > 0:
+            self._prog_bar.set(prog)
+            self._prog_label.configure(text=f"{int(prog * 100)}%")
+        else:
+            mb = job["bytes"] / 1_048_576
+            self._prog_label.configure(text=f"{mb:.1f} MB")
+        self._poll_id = self.after(250, lambda: self._watch_auto_dl(guid))
 
     def _poll_progress(self):
         status = self._dl_status
@@ -1367,6 +1546,7 @@ class App(ctk.CTk):
         self._state = StateManager()
         self._episodes: list = []
         self._batch_dl_active = False
+        self._auto_dl_jobs: dict = {}  # guid → {"progress": float, "status": str, "bytes": int}
 
         self.title(APP_TITLE)
         self.geometry("1140x720")
@@ -1474,6 +1654,7 @@ class App(ctk.CTk):
             self, self._state,
             on_downloaded=self._on_episode_downloaded,
             on_state_changed=self._on_state_changed,
+            auto_dl_jobs=self._auto_dl_jobs,
             fg_color="#222222", corner_radius=0,
         )
         self._detail.grid(row=1, column=1, sticky="nsew")
@@ -1526,6 +1707,8 @@ class App(ctk.CTk):
             # New or reordered episodes — rebuild the list
             self._episodes = new_eps
             self._populate_list()
+        self._apply_auto_keep()
+        self._apply_auto_download()
         self._status.configure(
             text=f"{len(new_eps)} episodes  ·  Updated {ts}",
             text_color="gray55",
@@ -1558,6 +1741,8 @@ class App(ctk.CTk):
             text_color="gray55",
         )
         self._populate_list()
+        self._apply_auto_keep()
+        self._apply_auto_download()
 
     def _on_feed_error(self, msg: str):
         self._refresh_btn.configure(state="normal")
@@ -1581,6 +1766,75 @@ class App(ctk.CTk):
 
     def _on_state_changed(self):
         self._ep_list.refresh()
+
+    def _apply_auto_keep(self):
+        """Delete episodes beyond the auto-keep limit, in feed order (newest first)."""
+        n = self._state.auto_keep
+        if n <= 0 or not self._episodes:
+            return
+        # self._episodes is in feed order (newest first)
+        downloaded_guids = [
+            ep["guid"] for ep in self._episodes
+            if self._state.is_downloaded(ep["guid"])
+        ]
+        to_delete = downloaded_guids[n:]
+        for guid in to_delete:
+            self._state.delete_episode(guid)
+        if to_delete:
+            self._ep_list.refresh_badges()
+
+    def _apply_auto_download(self):
+        """Download any missing episodes within the auto-keep window."""
+        n = self._state.auto_keep
+        if n <= 0 or not self._episodes:
+            return
+        # Take the N newest episodes that have a downloadable URL
+        candidates = [
+            ep for ep in self._episodes
+            if ep.get("enclosure_url")
+        ][:n]
+        pending = [ep for ep in candidates if not self._state.is_downloaded(ep["guid"])]
+        if not pending:
+            return
+
+        folder = Path(self._state.download_folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        total_count = len(pending)
+
+        def _worker():
+            for idx, ep in enumerate(pending, 1):
+                guid = ep["guid"]
+                self._auto_dl_jobs[guid] = {"progress": 0.0, "status": "downloading", "bytes": 0}
+                self.after(0, lambda i=idx, t=ep["title"]: self._status.configure(
+                    text=f"Auto-download {i}/{total_count}: {t[:50]}…",
+                    text_color="gray55",
+                ))
+
+                url = ep["enclosure_url"]
+                parsed = urlparse(url)
+                raw_name = unquote(parsed.path.split("/")[-1])
+                ext = Path(raw_name).suffix or ".mp4"
+                filename = sanitize_filename(ep["title"]) + ext
+                filepath = folder / filename
+
+                def _progress(received, total, g=guid):
+                    self._auto_dl_jobs[g]["bytes"] = received
+                    if total:
+                        self._auto_dl_jobs[g]["progress"] = received / total
+
+                try:
+                    download_file(url, filepath, progress_cb=_progress)
+                    self._state.mark_downloaded(guid, filename)
+                    self._auto_dl_jobs[guid]["status"] = "done"
+                    self.after(0, lambda g=guid: self._ep_list.refresh_badges())
+                except Exception as exc:
+                    print(f"[auto-dl] failed '{ep['title']}': {exc}")
+                    self._auto_dl_jobs[guid]["status"] = f"error:{exc}"
+            self.after(0, lambda: self._status.configure(
+                text="Auto-download complete.", text_color="#27ae60",
+            ))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Batch download ────────────────────────────────────────────────────────
 
@@ -1622,25 +1876,11 @@ class App(ctk.CTk):
                 filepath = folder / filename
 
                 try:
-                    resp = requests.get(
-                        url, stream=True, timeout=30,
-                        headers={"User-Agent": "TWiT-FeedManager/1.0"},
-                    )
-                    resp.raise_for_status()
-                    with open(filepath, "wb") as fh:
-                        for chunk in resp.iter_content(chunk_size=131072):
-                            if chunk:
-                                fh.write(chunk)
+                    download_file(url, filepath)
                     self._state.mark_downloaded(ep["guid"], filename)
                     self.after(0, lambda g=ep["guid"]: self._on_episode_downloaded(g))
-
                 except Exception as exc:
                     print(f"[batch] failed '{ep['title']}': {exc}")
-                    try:
-                        if filepath.exists():
-                            filepath.unlink()
-                    except Exception:
-                        pass
 
             self.after(0, self._on_batch_done)
 
@@ -1708,7 +1948,11 @@ class App(ctk.CTk):
     # ── Settings ──────────────────────────────────────────────────────────────
 
     def _open_settings(self):
-        SettingsDialog(self, self._state)
+        SettingsDialog(self, self._state, on_save=self._on_settings_saved)
+
+    def _on_settings_saved(self):
+        self._apply_auto_keep()
+        self._apply_auto_download()
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
