@@ -1,0 +1,22 @@
+# Claude Code
+.claude/
+
+# Runtime state (contains personal config and download history)
+state.json
+feed_cache.json
+thumb_cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
